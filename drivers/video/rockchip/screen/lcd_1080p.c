@@ -13,16 +13,16 @@
 #define OUT_FACE	    OUT_P888
 
 #define LCDC_ACLK		297000000
-#define DCLK	    	148500000
+#define DCLK	    	50000000//148500000
 
 #define H_PW			44
 #define H_BP			148
-#define H_VD			1920
+#define H_VD			1366//1920
 #define H_FP			88
 
 #define V_PW			5
 #define V_BP			36
-#define V_VD			1080
+#define V_VD			768//1080
 #define V_FP			4
 
 #define LCD_WIDTH          	0

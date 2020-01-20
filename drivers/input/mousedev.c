@@ -34,20 +34,24 @@ MODULE_DESCRIPTION("Mouse (ExplorerPS/2) device interfaces");
 MODULE_LICENSE("GPL");
 
 #ifndef CONFIG_INPUT_MOUSEDEV_SCREEN_X
-#define CONFIG_INPUT_MOUSEDEV_SCREEN_X	1024
+#define CONFIG_INPUT_MOUSEDEV_SCREEN_X	1366
 #endif
 #ifndef CONFIG_INPUT_MOUSEDEV_SCREEN_Y
 #define CONFIG_INPUT_MOUSEDEV_SCREEN_Y	768
 #endif
 
-static int xres = CONFIG_INPUT_MOUSEDEV_SCREEN_X;
+static int buttonStatus = 0 ;
+static int buttonStatusCounter = 0 ;
+
+static int xres = CONFIG_INPUT_MOUSEDEV_SCREEN_X/2;
 module_param(xres, uint, 0644);
 MODULE_PARM_DESC(xres, "Horizontal screen resolution");
 
-static int yres = CONFIG_INPUT_MOUSEDEV_SCREEN_Y;
+static int yres = CONFIG_INPUT_MOUSEDEV_SCREEN_Y/2;
 module_param(yres, uint, 0644);
 MODULE_PARM_DESC(yres, "Vertical screen resolution");
 
+static unsigned wanttoscroll = 0;
 static unsigned tap_time = 200;
 module_param(tap_time, uint, 0644);
 MODULE_PARM_DESC(tap_time, "Tap time for touchpads in absolute mode (msecs)");
@@ -123,6 +127,9 @@ static LIST_HEAD(mousedev_mix_list);
 
 static void mixdev_open_devices(void);
 static void mixdev_close_devices(void);
+
+static void mousedev_key_event(struct mousedev *mousedev,
+				unsigned int code, int value);
 
 #define fx(i)  (mousedev->old_x[(mousedev->pkt_count - (i)) & 03])
 #define fy(i)  (mousedev->old_y[(mousedev->pkt_count - (i)) & 03])
@@ -205,6 +212,8 @@ static void mousedev_abs_event(struct input_dev *dev, struct mousedev *mousedev,
 
 		mousedev->packet.y = yres - ((value - min) * yres) / size;
 		mousedev->packet.abs_event = 1;
+                
+                
 		break;
 	}
 }
@@ -225,6 +234,93 @@ static void mousedev_rel_event(struct mousedev *mousedev,
 		mousedev->packet.dz -= value;
 		break;
 	}
+}
+
+static void mousedev_notify_readers(struct mousedev *mousedev,
+				    struct mousedev_hw_data *packet)
+{
+	struct mousedev_client *client;
+	struct mousedev_motion *p;
+	unsigned int new_head;
+	int wake_readers = 0;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(client, &mousedev->client_list, node) {
+
+		/* Just acquire the lock, interrupts already disabled */
+		spin_lock(&client->packet_lock);
+
+		p = &client->packets[client->head];
+		if (client->ready && p->buttons != mousedev->packet.buttons) {
+			new_head = (client->head + 1) % PACKET_QUEUE_LEN;
+			if (new_head != client->tail) {
+				p = &client->packets[client->head = new_head];
+				memset(p, 0, sizeof(struct mousedev_motion));
+			}
+		}
+
+                int temp1 = packet->x - client->pos_x;
+                int temp2 = packet->y - client->pos_y;
+		
+		if (packet->abs_event ) {
+                    
+                    // Calibration does not scroll 
+                    // when the user presses very close points (precision is 6 pxs)
+                    if(temp1*temp1 > 36 || temp2*temp2 > 36)
+                    {
+			p->dx += temp1 ; 
+			p->dy += temp2 ;
+			client->pos_x = packet->x ;
+			client->pos_y = packet->y ;
+                    }
+		}
+		
+		
+		// when the user presses the touch screen
+		if(buttonStatus == 1)
+                    ++buttonStatusCounter;
+                
+                // when the user presses a different point of the touch screen
+                if( temp1 * temp1 > 5 && temp2 * temp2 > 5) 
+                    buttonStatusCounter = 0;
+		
+                // when user scrolls on the touchscreen
+                if(buttonStatusCounter > 2 ){
+                    wanttoscroll = 1;
+                    mousedev_key_event(mousedev, BTN_TOUCH, buttonStatus);
+                }
+                else if(wanttoscroll){
+                    wanttoscroll = 0;
+                    mousedev_key_event(mousedev, BTN_TOUCH, buttonStatus);
+                }
+
+		client->pos_x += packet->dx;
+		client->pos_x = client->pos_x < 0 ?
+			0 : (client->pos_x >= xres ? xres : client->pos_x);
+		client->pos_y += packet->dy;
+		client->pos_y = client->pos_y < 0 ?
+			0 : (client->pos_y >= yres ? yres : client->pos_y);
+
+		p->dx += packet->dx;
+		p->dy += packet->dy;
+		p->dz += packet->dz;
+		p->buttons = mousedev->packet.buttons;
+
+		if (p->dx || p->dy || p->dz ||
+		    p->buttons != client->last_buttons)
+			client->ready = 1;
+
+		spin_unlock(&client->packet_lock);
+
+		if (client->ready) {
+			kill_fasync(&client->fasync, SIGIO, POLL_IN);
+			wake_readers = 1;
+		}
+	}
+	rcu_read_unlock();
+
+	if (wake_readers)
+		wake_up_interruptible(&mousedev->wait);
 }
 
 static void mousedev_key_event(struct mousedev *mousedev,
@@ -258,71 +354,24 @@ static void mousedev_key_event(struct mousedev *mousedev,
 	}
 
 	if (value) {
-		set_bit(index, &mousedev->packet.buttons);
+
+            if(wanttoscroll == 1){
+                set_bit(index, &mousedev->packet.buttons);
 		set_bit(index, &mousedev_mix->packet.buttons);
+            }
+
 	} else {
+            
+            if(wanttoscroll != 1){
+                set_bit(index, &mousedev->packet.buttons);
+		set_bit(index, &mousedev_mix->packet.buttons);
+                mousedev_notify_readers(mousedev, &mousedev_mix->packet);
+                mousedev_notify_readers(mousedev_mix,&mousedev_mix->packet);
+            }
 		clear_bit(index, &mousedev->packet.buttons);
 		clear_bit(index, &mousedev_mix->packet.buttons);
+                 
 	}
-}
-
-static void mousedev_notify_readers(struct mousedev *mousedev,
-				    struct mousedev_hw_data *packet)
-{
-	struct mousedev_client *client;
-	struct mousedev_motion *p;
-	unsigned int new_head;
-	int wake_readers = 0;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(client, &mousedev->client_list, node) {
-
-		/* Just acquire the lock, interrupts already disabled */
-		spin_lock(&client->packet_lock);
-
-		p = &client->packets[client->head];
-		if (client->ready && p->buttons != mousedev->packet.buttons) {
-			new_head = (client->head + 1) % PACKET_QUEUE_LEN;
-			if (new_head != client->tail) {
-				p = &client->packets[client->head = new_head];
-				memset(p, 0, sizeof(struct mousedev_motion));
-			}
-		}
-
-		if (packet->abs_event) {
-			p->dx += packet->x - client->pos_x;
-			p->dy += packet->y - client->pos_y;
-			client->pos_x = packet->x;
-			client->pos_y = packet->y;
-		}
-
-		client->pos_x += packet->dx;
-		client->pos_x = client->pos_x < 0 ?
-			0 : (client->pos_x >= xres ? xres : client->pos_x);
-		client->pos_y += packet->dy;
-		client->pos_y = client->pos_y < 0 ?
-			0 : (client->pos_y >= yres ? yres : client->pos_y);
-
-		p->dx += packet->dx;
-		p->dy += packet->dy;
-		p->dz += packet->dz;
-		p->buttons = mousedev->packet.buttons;
-
-		if (p->dx || p->dy || p->dz ||
-		    p->buttons != client->last_buttons)
-			client->ready = 1;
-
-		spin_unlock(&client->packet_lock);
-
-		if (client->ready) {
-			kill_fasync(&client->fasync, SIGIO, POLL_IN);
-			wake_readers = 1;
-		}
-	}
-	rcu_read_unlock();
-
-	if (wake_readers)
-		wake_up_interruptible(&mousedev->wait);
 }
 
 static void mousedev_touchpad_touch(struct mousedev *mousedev, int value)
@@ -336,20 +385,23 @@ static void mousedev_touchpad_touch(struct mousedev *mousedev, int value)
 			 * We rely on the fact that mousedev_mix always has 0
 			 * motion packet so we won't mess current position.
 			 */
-			set_bit(0, &mousedev->packet.buttons);
+                        
+                        set_bit(0, &mousedev->packet.buttons);
 			set_bit(0, &mousedev_mix->packet.buttons);
-			mousedev_notify_readers(mousedev, &mousedev_mix->packet);
-			mousedev_notify_readers(mousedev_mix,
-						&mousedev_mix->packet);
+                        
+ 			mousedev_notify_readers(mousedev, &mousedev_mix->packet);
+ 			mousedev_notify_readers(mousedev_mix,&mousedev_mix->packet);
+
 			clear_bit(0, &mousedev->packet.buttons);
 			clear_bit(0, &mousedev_mix->packet.buttons);
 		}
-		mousedev->touch = mousedev->pkt_count = 0;
+		mousedev->touch = 0 ;
+                mousedev->pkt_count = 0;
 		mousedev->frac_dx = 0;
 		mousedev->frac_dy = 0;
 
 	} else if (!mousedev->touch)
-		mousedev->touch = jiffies;
+		mousedev->touch = jiffies;   
 }
 
 static void mousedev_event(struct input_handle *handle,
@@ -377,13 +429,16 @@ static void mousedev_event(struct input_handle *handle,
 		break;
 
 	case EV_KEY:
-		if (value != 2) {
-			if (code == BTN_TOUCH &&
-			    test_bit(BTN_TOOL_FINGER, handle->dev->keybit))
-				mousedev_touchpad_touch(mousedev, value);
-			else
-				mousedev_key_event(mousedev, code, value);
-		}
+		if (value != 2) 
+                {
+ 			if (code == BTN_TOUCH &&
+ 			    test_bit(BTN_TOOL_FINGER, handle->dev->keybit))
+ 				mousedev_touchpad_touch(mousedev, value);
+ 			else
+ 				mousedev_key_event(mousedev, code, value);
+                        
+                        buttonStatus = value ;
+		}//
 		break;
 
 	case EV_SYN:
